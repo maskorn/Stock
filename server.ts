@@ -6,6 +6,23 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+// Self-ping keeping-alive mechanism to prevent Render's Free Tier from spinning down (which happens after 15 mins of inactivity)
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
+if (RENDER_EXTERNAL_URL) {
+  const pingInterval = 14 * 60 * 1000; // 14 minutes
+  console.log(`[Keep-Alive] Render environment detected. Scheduled self-ping every 14 minutes to: ${RENDER_EXTERNAL_URL}`);
+  setInterval(async () => {
+    try {
+      const baseUrl = RENDER_EXTERNAL_URL.endsWith("/") ? RENDER_EXTERNAL_URL : `${RENDER_EXTERNAL_URL}/`;
+      // Fetching home page to register active incoming traffic
+      const response = await fetch(baseUrl);
+      console.log(`[Keep-Alive] Self-pinged successfully at ${new Date().toISOString()}. Status code: ${response.status}`);
+    } catch (err: any) {
+      console.warn(`[Keep-Alive] Scheduled self-ping failed:`, err.message || err);
+    }
+  }, pingInterval);
+}
+
 const app = express();
 const PORT = process.env.PORT || "3000";
 
