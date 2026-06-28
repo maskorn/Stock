@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   FileSpreadsheet, 
   UploadCloud, 
@@ -109,13 +109,16 @@ export default function App() {
     }
   });
 
-  const handleToggleTrackingStatus = (recordId: string, status: 'po' | 'request_payment' | 'paid') => {
+  const handleToggleTrackingStatus = async (recordId: string, status: 'po' | 'request_payment' | 'paid') => {
+    // 1. Synchronously compute the updated state based on current state
+    const recordStatus = trackingStatuses[recordId] || {};
+    const updatedRecordStatus = {
+      ...recordStatus,
+      [status]: !recordStatus[status]
+    };
+
+    // 2. Optimistically update local tracking statuses state first
     setTrackingStatuses(prev => {
-      const recordStatus = prev[recordId] || {};
-      const updatedRecordStatus = {
-        ...recordStatus,
-        [status]: !recordStatus[status]
-      };
       const updated = {
         ...prev,
         [recordId]: updatedRecordStatus
@@ -123,6 +126,35 @@ export default function App() {
       localStorage.setItem('receipt_tracking_statuses_v2', JSON.stringify(updated));
       return updated;
     });
+
+    // 3. If it is a Google Sheet record, immediately write/sync the update to Google Sheets
+    if (recordId.startsWith('sheet-')) {
+      const record = sheetReceipts.find(r => r.id === recordId);
+      if (record) {
+        showToast(`正在同步状态 [${status === 'po' ? 'PO' : status === 'request_payment' ? '提付款' : '已付款'}] 到云表格...`, "success");
+        try {
+          const finalizedRecord = {
+            ...record,
+            po: !!updatedRecordStatus.po,
+            request_payment: !!updatedRecordStatus.request_payment,
+            paid: !!updatedRecordStatus.paid
+          };
+
+          if (sheetConfig.syncMode === 'appsScript') {
+            await syncViaAppsScript(sheetConfig, finalizedRecord);
+          } else {
+            if (!googleAccessToken) {
+              throw new Error("谷歌 API 授权已失效，请重新点击顶部 Google 登录！");
+            }
+            await syncDirectToGoogleSheet(sheetConfig, googleAccessToken, finalizedRecord);
+          }
+          showToast(`⚡ 云端状态已成功同步保存！`, "success");
+        } catch (err: any) {
+          console.error("Failed to sync tracking status to Google Sheets:", err);
+          showToast(`云保存失败：${err.message || "请求被拒绝"}`, "error");
+        }
+      }
+    }
   };
 
   // Ledger query search
@@ -135,7 +167,42 @@ export default function App() {
   const [isFetchingSheet, setIsFetchingSheet] = useState(false);
   const [sheetFetchError, setSheetFetchError] = useState<string | null>(null);
 
+  // Default to current month based on system date (e.g. "2026-06")
+  const [selectedMonth, setSelectedMonth] = useState<string>(() => {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    return `${yyyy}-${mm}`;
+  });
+
+  // Calculate unique months dynamically from record dates, always ensuring the current month exists
+  const availableMonths = useMemo(() => {
+    const months = new Set<string>();
+    const now = new Date();
+    const currentYm = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    months.add(currentYm);
+    
+    sheetReceipts.forEach(r => {
+      if (r.date && r.date.length >= 7) {
+        const ym = r.date.substring(0, 7); // "YYYY-MM"
+        if (/^\d{4}-\d{2}$/.test(ym)) {
+          months.add(ym);
+        }
+      }
+    });
+    
+    return Array.from(months).sort((a, b) => b.localeCompare(a));
+  }, [sheetReceipts]);
+
   const filteredReceipts = sheetReceipts.filter((r) => {
+    // 1. Month filter (if not "all")
+    if (selectedMonth !== 'all') {
+      if (!r.date || !r.date.startsWith(selectedMonth)) {
+        return false;
+      }
+    }
+
+    // 2. Query filter
     const q = searchQuery.toLowerCase().trim().replace('฿', '');
     if (!q) return true;
     
@@ -420,10 +487,15 @@ export default function App() {
     }
 
     setIsSyncingSheet(true);
+    const draftStatus = trackingStatuses[activeDraft.id] || {};
     const finalizedDraft = {
       ...activeDraft,
       taxAmount: draftTax,
-      taxInclusive: draftTaxInclusive
+      taxInclusive: draftTaxInclusive,
+      po: !!draftStatus.po,
+      request_payment: !!draftStatus.request_payment,
+      paid: !!draftStatus.paid,
+      receiptType: activeDraft.receiptType || ''
     };
     const isUpdateMode = !!(activeDraft.startRowIndex && activeDraft.endRowIndex);
 
@@ -511,13 +583,21 @@ export default function App() {
       }
     }
 
+    const recordStatus = trackingStatuses[recordToSync.id] || {};
+    const finalizedRecord = {
+      ...recordToSync,
+      po: !!recordStatus.po,
+      request_payment: !!recordStatus.request_payment,
+      paid: !!recordStatus.paid
+    };
+
     showToast(`正在重试单号 [${recordToSync.receiptNumber}] 写入 Google 电子表...`, 'success');
     try {
       if (sheetConfig.syncMode === 'appsScript') {
-        await syncViaAppsScript(sheetConfig, recordToSync);
+        await syncViaAppsScript(sheetConfig, finalizedRecord);
       } else {
         if (!googleAccessToken) throw new Error("授权缺失");
-        await syncDirectToGoogleSheet(sheetConfig, googleAccessToken, recordToSync);
+        await syncDirectToGoogleSheet(sheetConfig, googleAccessToken, finalizedRecord);
       }
 
       showToast(`⚡ 云同步成功！单号 [${recordToSync.receiptNumber}] 状态已更新`, 'success');
@@ -585,10 +665,25 @@ export default function App() {
     setSheetFetchError(null);
     try {
       const records = await fetchRecordsFromGoogleSheet(sheetConfig, googleAccessToken);
+      
+      // Update trackingStatuses with the values loaded from Google Sheet
+      setTrackingStatuses(prev => {
+        const updated = { ...prev };
+        records.forEach(r => {
+          updated[r.id] = {
+            po: !!r.po,
+            request_payment: !!r.request_payment,
+            paid: !!r.paid
+          };
+        });
+        localStorage.setItem('receipt_tracking_statuses_v2', JSON.stringify(updated));
+        return updated;
+      });
+
       // reverse so newest entries are displayed first
       setSheetReceipts(records.reverse());
       if (!silent) {
-        showToast(`⚡ 成功从 Google Sheet 同步读取了 ${records.length} 条登记记录！`, "success");
+        showToast(`⚡ 成功从 Google Sheet 同步读取了 ${records.length} 条登记记录并对齐了收付状态！`, "success");
       }
     } catch (err: any) {
       console.error("Sheet loading error:", err);
@@ -598,6 +693,69 @@ export default function App() {
       }
     } finally {
       setIsFetchingSheet(false);
+    }
+  };
+
+  const [isBeautifyingBorders, setIsBeautifyingBorders] = useState(false);
+
+  const handleBeautifyBorders = async () => {
+    if (!sheetConfig.spreadsheetId) {
+      showToast("请先在上方设置面板配置您的 Google Spreadsheet ID！", "error");
+      return;
+    }
+    if (sheetConfig.syncMode === 'appsScript' && !sheetConfig.appsScriptUrl) {
+      showToast("请先在上方设置面板配置您的 Google Apps Script 部署 URL！", "error");
+      return;
+    }
+    if (sheetConfig.syncMode === 'directApi' && !googleAccessToken) {
+      showToast("直接 API 读写未授权，请点击上方“Google 登录”完成授权！", "error");
+      return;
+    }
+
+    setIsBeautifyingBorders(true);
+    showToast("正在一键重构与修复云端工作表边框，请稍候...", "success");
+
+    try {
+      // 1. Fetch latest raw records to ensure we have precise row indexes
+      const records = await fetchRecordsFromGoogleSheet(sheetConfig, googleAccessToken);
+      if (!records || records.length === 0) {
+        showToast("未检测到云表格中的单据数据，无需修复！", "error");
+        setIsBeautifyingBorders(false);
+        return;
+      }
+
+      // 2. Collect endRowIndexes from each record (1-based sheet row numbers)
+      const endRowIndexes = records.map(r => r.endRowIndex).filter(idx => typeof idx === 'number' && idx > 0);
+
+      // 3. Post to proxy endpoint
+      const response = await fetch('/api/proxy-beautify-borders', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          spreadsheetId: sheetConfig.spreadsheetId,
+          accessToken: googleAccessToken,
+          appsScriptUrl: sheetConfig.syncMode === 'appsScript' ? sheetConfig.appsScriptUrl : undefined,
+          sheetName: sheetConfig.sheetName || 'Sheet1',
+          endRowIndexes
+        })
+      });
+
+      const resJson = await response.json().catch(() => ({}));
+      if (!response.ok || !resJson.success) {
+        throw new Error(resJson.error || "修复请求未能被服务器解析完成。");
+      }
+
+      showToast("🎉 恭喜！云端电子表所有单据分割线已完美恢复并重构！", "success");
+      
+      // Refresh local copy
+      await handleFetchSheetRecords(true);
+    } catch (err: any) {
+      console.error("Beautify borders failed:", err);
+      showToast(`边框重构修复失败: ${err.message || "请求异常"}`, "error");
+    } finally {
+      setIsBeautifyingBorders(false);
     }
   };
 
@@ -650,14 +808,39 @@ export default function App() {
       sheet = ss.insertSheet(sheetName);
     }
     
+    // 一键重构美化/修复边框
+    if (payload.action === "beautifyBorders") {
+      var lastRow = sheet.getLastRow();
+      var lastCol = Math.max(16, sheet.getLastColumn());
+      if (lastRow > 1) {
+        // A. 先清除第 2 行到最后一行所有单元格的所有边框，防止遗存
+        var dataRange = sheet.getRange(2, 1, lastRow - 1, lastCol);
+        dataRange.setBorder(null, null, false, null, null, false, null, null);
+        
+        // B. 针对每个单据的最后一行重新绘制粗底边框
+        var endRowIndexes = payload.endRowIndexes;
+        if (endRowIndexes && endRowIndexes.length) {
+          for (var i = 0; i < endRowIndexes.length; i++) {
+            var rIndex = parseInt(endRowIndexes[i], 10);
+            if (rIndex >= 2 && rIndex <= lastRow) {
+              var rangeToLine = sheet.getRange(rIndex, 1, 1, lastCol);
+              rangeToLine.setBorder(null, null, true, null, null, null, "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+            }
+          }
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({ success: true, message: "Borders beautified successfully!" }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    
     // 如果工作表是个新表/首行为空，自动附加规范列名
     if (sheet.getLastRow() === 0) {
       sheet.appendRow([
         "入库日期", "供应商", "物料编码", "物料名称", "规格型号", 
         "单位", "数量", "不含税单价", "不含税金额", "税前总价", 
-        "7%税额", "含税金额"
+        "7%税额", "含税金额", "票据类型", "po", "提付款", "已付款"
       ]);
-      sheet.getRange(1, 1, 1, 12).setFontWeight("bold").setBackground("#F1F5F9");
+      sheet.getRange(1, 1, 1, 16).setFontWeight("bold").setBackground("#F1F5F9");
     }
     
     var rows = payload.rows;
@@ -666,18 +849,34 @@ export default function App() {
 
     if (startRowIndex && endRowIndex) {
       var numRowsToDelete = parseInt(endRowIndex, 10) - parseInt(startRowIndex, 10) + 1;
-      if (numRowsToDelete > 0) {
-        sheet.deleteRows(parseInt(startRowIndex, 10), numRowsToDelete);
-      }
       if (rows && rows.length) {
-        sheet.insertRowsBefore(parseInt(startRowIndex, 10), rows.length);
-        for (var i = 0; i < rows.length; i++) {
-          var targetRow = parseInt(startRowIndex, 10) + i;
-          var range = sheet.getRange(targetRow, 1, 1, rows[i].length);
-          range.setValues([rows[i]]);
+        if (numRowsToDelete === rows.length) {
+          // 如果行数完全一致（例如点击勾选 PO / 提付款状态），直接原地写入数值，完美保留原有格式、行高和邻近边框
+          for (var i = 0; i < rows.length; i++) {
+            var targetRow = parseInt(startRowIndex, 10) + i;
+            var range = sheet.getRange(targetRow, 1, 1, rows[i].length);
+            range.setValues([rows[i]]);
+          }
+        } else {
+          // 行数不一致时才进行删除与重插
+          if (numRowsToDelete > 0) {
+            sheet.deleteRows(parseInt(startRowIndex, 10), numRowsToDelete);
+          }
+          sheet.insertRowsBefore(parseInt(startRowIndex, 10), rows.length);
+          
+          // 获取新插入的完整范围，清除其下边框和内部水平边框，防止继承自上方前一个单据的底边框
+          var lastCol = Math.max(16, sheet.getLastColumn());
+          var entireInsertedRange = sheet.getRange(parseInt(startRowIndex, 10), 1, rows.length, lastCol);
+          entireInsertedRange.setBorder(null, null, false, null, null, false, null, null);
+
+          for (var i = 0; i < rows.length; i++) {
+            var targetRow = parseInt(startRowIndex, 10) + i;
+            var range = sheet.getRange(targetRow, 1, 1, rows[i].length);
+            range.setValues([rows[i]]);
+          }
         }
         var endRow = parseInt(startRowIndex, 10) + rows.length - 1;
-        var lastCol = Math.max(12, sheet.getLastColumn());
+        var lastCol = Math.max(16, sheet.getLastColumn());
         var rangeToLine = sheet.getRange(endRow, 1, 1, lastCol);
         rangeToLine.setBorder(null, null, true, null, null, null, "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
       }
@@ -693,7 +892,7 @@ export default function App() {
       var endRow = sheet.getLastRow();
       
       if (endRow >= startRow) {
-        var lastCol = Math.max(12, sheet.getLastColumn());
+        var lastCol = Math.max(16, sheet.getLastColumn());
         var rangeToLine = sheet.getRange(endRow, 1, 1, lastCol);
         // setBorder(top, left, bottom, right, vertical, horizontal, color, style)
         // 每一个登记的验收单据下方，在最后一行物料下绘制一条优雅的黑色下边框作为单据底部分割线
@@ -1667,14 +1866,38 @@ function doGet(e) {
             {/* 4. Google Sheet Linked Ledger Board */}
             <div style={{ marginTop: '-30px', paddingLeft: '10px', paddingRight: '10px', paddingTop: '15px', paddingBottom: '15px', width: '1275.4px' }} className="flex-1 bg-white border border-slate-200/90 rounded-3xl shadow-xs space-y-5" id="local-ledger-board">
               <div style={{ marginBottom: '5px', paddingBottom: '0px', paddingRight: '0px', paddingTop: '0px' }} className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-100 pb-4">
-                <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-3">
                   <h3 className="font-extrabold text-[14px] text-slate-900 tracking-tight flex items-center gap-2">
                     <Database size={16} className="text-emerald-600 font-extrabold animate-pulse" />
                     <span>票据登记</span>
                     <span className="text-[10px] font-black bg-emerald-50 text-emerald-800 border border-emerald-150 px-1.5 py-0.5 rounded-full">
-                      {sheetReceipts.length} 笔云端记录
+                      {filteredReceipts.length === sheetReceipts.length 
+                        ? `${sheetReceipts.length} 笔云端记录` 
+                        : `筛选: ${filteredReceipts.length} / ${sheetReceipts.length} 笔`}
                     </span>
                   </h3>
+                  
+                  {/* Month Selection dropdown */}
+                  <div className="flex items-center gap-1.5 bg-slate-50/85 hover:bg-slate-100/80 border border-slate-200/80 rounded-xl px-2.5 py-1 transition-all shadow-3xs">
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">
+                      月份:
+                    </span>
+                    <select
+                      value={selectedMonth}
+                      onChange={(e) => setSelectedMonth(e.target.value)}
+                      className="bg-transparent border-none text-[11px] font-black text-slate-800 outline-hidden cursor-pointer focus:ring-0 p-0"
+                    >
+                      <option value="all">🗓️ 全部月份</option>
+                      {availableMonths.map((ym) => {
+                        const [year, month] = ym.split('-');
+                        return (
+                          <option key={ym} value={ym}>
+                            🗓️ {year}年{month}月
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -1697,6 +1920,16 @@ function doGet(e) {
                   >
                     <RefreshCw size={11} className={isFetchingSheet ? "animate-spin text-emerald-600" : "text-slate-400"} />
                     <span>{isFetchingSheet ? "获取中..." : "刷新云端数据"}</span>
+                  </button>
+
+                  <button
+                    onClick={handleBeautifyBorders}
+                    disabled={isBeautifyingBorders || isFetchingSheet}
+                    title="一键自动清除 Google 电子表中已被画乱、多余或遗留的分割线条，并重新为每一个独立单据绘制精美的底部分割线。"
+                    className="flex items-center gap-1.5 p-1.5 px-2.5 text-[11px] bg-amber-50 hover:bg-amber-100 text-amber-800 hover:text-amber-900 font-extrabold border border-amber-200 rounded-xl transition-all cursor-pointer disabled:opacity-50"
+                  >
+                    <Sparkles size={11} className={isBeautifyingBorders ? "animate-spin text-amber-600" : "text-amber-500"} />
+                    <span>{isBeautifyingBorders ? "正在重构修复..." : "一键修复分割线"}</span>
                   </button>
 
                   <button
@@ -1798,8 +2031,10 @@ function doGet(e) {
                   </p>
                 </div>
               ) : filteredReceipts.length === 0 ? (
-                <div className="text-center py-8 text-gray-400 text-xs font-medium">
-                  没有匹配 "{searchQuery}" 的搜索记录。
+                <div className="text-center py-8 text-slate-400 text-xs font-bold font-sans">
+                  {searchQuery 
+                    ? `在该月份下没有匹配 "${searchQuery}" 的搜索记录。` 
+                    : "该月份下暂无任何票据记录。"}
                 </div>
               ) : (
                 /* Enhanced Table View where rows are perfectly separated using neat serial index values */
