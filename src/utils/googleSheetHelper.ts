@@ -46,6 +46,10 @@ export function formatReceiptForSheet(record: {
   endRowIndex?: number;
   taxAmount?: number;
   taxInclusive?: number;
+  po?: boolean;
+  request_payment?: boolean;
+  paid?: boolean;
+  receiptType?: string;
 }) {
   const untaxedTotal = record.totalAmount;
   const taxAmount = typeof record.taxAmount === 'number' ? record.taxAmount : Math.round((untaxedTotal * 0.07) * 100) / 100;
@@ -54,18 +58,22 @@ export function formatReceiptForSheet(record: {
 
   // 1. Regular item rows representing the voucher entries
   const rows: any[][] = record.items.map((item, index) => [
-    record.date,                         // 1. 入库日期
-    record.supplier,                     // 2. 供应商
-    item.code || '',                     // 3. 物料编码
-    item.name,                           // 4. 物料名称
-    item.specification || '',            // 5. 规格型号
-    item.unit || '件',                   // 6. 单位
-    item.quantity,                       // 7. 数量
-    item.unitPrice,                      // 8. 不含税单价
-    Math.round((item.quantity * item.unitPrice) * 100) / 100, // 9. 不含税金额 (小计)
-    index === 0 ? untaxedTotal : '',                        // 10. 整单不含税总价 (首行)
-    index === 0 ? taxAmount : '',                           // 11. 7%税额 (首行)
-    index === 0 ? taxInclusive : '',                         // 12. 含税总金额 (首行)
+    record.date,                         // 1. 入库日期 (A)
+    record.supplier,                     // 2. 供应商 (B)
+    item.code || '',                     // 3. 物料编码 (C)
+    item.name,                           // 4. 物料名称 (D)
+    item.specification || '',            // 5. 规格型号 (E)
+    item.unit || '件',                   // 6. 单位 (F)
+    item.quantity,                       // 7. 数量 (G)
+    item.unitPrice,                      // 8. 不含税单价 (H)
+    Math.round((item.quantity * item.unitPrice) * 100) / 100, // 9. 不含税金额 (I)
+    index === 0 ? untaxedTotal : '',                        // 10. 整单不含税总价 (J)
+    index === 0 ? taxAmount : '',                           // 11. 7%税额 (K)
+    index === 0 ? taxInclusive : '',                         // 12. 含税总金额 (L)
+    index === 0 ? (record.receiptType || '') : '',          // 13. 票据类型 (M)
+    index === 0 ? (record.po ? '✓' : '') : '',               // 14. po (N)
+    index === 0 ? (record.request_payment ? '✓' : '') : '',  // 15. 提付款 (O)
+    index === 0 ? (record.paid ? '✓' : '') : '',             // 16. 已付款 (P)
   ]);
 
   return rows;
@@ -162,7 +170,7 @@ export async function syncViaAppsScript(
 /**
  * Parsed spreadsheet raw data rows into active ReceiptRecord objects
  */
-export function parseSheetRowsToReceipts(rows: any[][]): any[] {
+export function parseSheetRowsToReceipts(rows: any[][], sheetName: string = 'Sheet1'): any[] {
   if (!rows || rows.length <= 1) return [];
   
   const dataRows = rows.slice(1); // skip header row
@@ -195,6 +203,10 @@ export function parseSheetRowsToReceipts(rows: any[][]): any[] {
     const untaxedTotal = row[9] ? parseFloat(String(row[9]).replace(/[^\d.-]/g, '')) || 0 : 0;
     const taxAmount = row[10] ? parseFloat(String(row[10]).replace(/[^\d.-]/g, '')) || 0 : 0;
     const taxInclusive = row[11] ? parseFloat(String(row[11]).replace(/[^\d.-]/g, '')) || 0 : 0;
+    const receiptType = row[12] ? String(row[12]).trim() : '';
+    const poVal = row[13] ? String(row[13]).trim() : '';
+    const requestPaymentVal = row[14] ? String(row[14]).trim() : '';
+    const paidVal = row[15] ? String(row[15]).trim() : '';
     
     if (!name && !supplier && !date) continue;
     
@@ -212,7 +224,7 @@ export function parseSheetRowsToReceipts(rows: any[][]): any[] {
       const receiptNo = `AP${datePart}${1000 + serial}`;
       
       currentRecord = {
-        id: `sheet-${records.length}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        id: `sheet-${sheetName}-${i + 2}`,
         receiptNumber: receiptNo,
         date: date,
         supplier: supplier,
@@ -225,7 +237,11 @@ export function parseSheetRowsToReceipts(rows: any[][]): any[] {
         startRowIndex: i + 2,
         endRowIndex: i + 2,
         taxAmount: taxAmount || 0,
-        taxInclusive: taxInclusive || 0
+        taxInclusive: taxInclusive || 0,
+        receiptType: receiptType,
+        po: poVal === '✓' || poVal === '是' || poVal.toLowerCase() === 'true',
+        request_payment: requestPaymentVal === '✓' || requestPaymentVal === '是' || requestPaymentVal.toLowerCase() === 'true',
+        paid: paidVal === '✓' || paidVal === '是' || paidVal.toLowerCase() === 'true'
       };
     }
     
@@ -290,7 +306,7 @@ export async function fetchRecordsFromGoogleSheet(
       throw new Error(errorMsg);
     }
 
-    return parseSheetRowsToReceipts(resJson.rows || []);
+    return parseSheetRowsToReceipts(resJson.rows || [], config.sheetName || 'Sheet1');
   } else {
     // directApi mode
     if (!accessToken) {
@@ -315,6 +331,6 @@ export async function fetchRecordsFromGoogleSheet(
       throw new Error(errorMsg);
     }
 
-    return parseSheetRowsToReceipts(resJson.data?.values || []);
+    return parseSheetRowsToReceipts(resJson.data?.values || [], config.sheetName || 'Sheet1');
   }
 }
