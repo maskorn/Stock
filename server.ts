@@ -198,12 +198,12 @@ app.post("/api/parse-receipt", async (req, res) => {
 // Proxy Google Apps Script Web App requests to avoid browser CORS/IFrame restrictions
 app.post("/api/proxy-apps-script", async (req, res) => {
   try {
-    const { appsScriptUrl, spreadsheetId, sheetName, rows } = req.body;
+    const { appsScriptUrl, spreadsheetId, sheetName, rows, startRowIndex, endRowIndex } = req.body;
     if (!appsScriptUrl || !rows) {
       return res.status(400).json({ error: "Missing appsScriptUrl or rows data." });
     }
 
-    const payload = { spreadsheetId, sheetName, rows };
+    const payload = { spreadsheetId, sheetName, rows, startRowIndex, endRowIndex };
     
     // Server-side fetch avoids CORS preflight failures inside browser iframe sandbox
     const response = await fetch(appsScriptUrl.trim(), {
@@ -252,7 +252,7 @@ app.post("/api/proxy-get-sheets", async (req, res) => {
     if (!spreadsheetId || !accessToken) {
       return res.status(400).json({ error: "Missing spreadsheetId or accessToken." });
     }
-    const range = sheetName ? `${sheetName}!A:L` : "Sheet1!A:L";
+    const range = sheetName ? `${sheetName}!A:P` : "Sheet1!A:P";
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}`;
     
     const response = await fetch(url, {
@@ -347,7 +347,7 @@ app.post("/api/proxy-direct-sheets", async (req, res) => {
       return res.status(400).json({ error: "Missing spreadsheetId, accessToken, or values." });
     }
 
-    const sheetTabRange = range || "Sheet1!A:M";
+    const sheetTabRange = range || "Sheet1!A:P";
     const dIndex = sheetTabRange.indexOf("!");
     const sheetName = dIndex !== -1 ? sheetTabRange.substring(0, dIndex).replace(/^'|'$/g, "") : "Sheet1";
 
@@ -377,49 +377,53 @@ app.post("/api/proxy-direct-sheets", async (req, res) => {
       const endIdx = Number(endRowIndex); // 0-based end index (exclusive)
       const newRowCount = values.length;
 
-      // 2. Perform atomic batchUpdate to delete original rows and insert new empty rows at startIdx
+      // 2. Perform atomic batchUpdate to delete original rows and insert new empty rows at startIdx ONLY if row count changed
       const updateUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`;
-      const batchUpdatePayload = {
-        requests: [
-          {
-            deleteDimension: {
-              range: {
-                sheetId: sheetId,
-                dimension: "ROWS",
-                startIndex: startIdx,
-                endIndex: endIdx
+      const isSameRowCount = (endIdx - startIdx) === newRowCount;
+
+      if (!isSameRowCount) {
+        const batchUpdatePayload = {
+          requests: [
+            {
+              deleteDimension: {
+                range: {
+                  sheetId: sheetId,
+                  dimension: "ROWS",
+                  startIndex: startIdx,
+                  endIndex: endIdx
+                }
+              }
+            },
+            {
+              insertDimension: {
+                range: {
+                  sheetId: sheetId,
+                  dimension: "ROWS",
+                  startIndex: startIdx,
+                  endIndex: startIdx + newRowCount
+                },
+                inheritFromBefore: false
               }
             }
+          ]
+        };
+
+        const batchResponse = await fetch(updateUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Content-Type": "application/json"
           },
-          {
-            insertDimension: {
-              range: {
-                sheetId: sheetId,
-                dimension: "ROWS",
-                startIndex: startIdx,
-                endIndex: startIdx + newRowCount
-              },
-              inheritFromBefore: true
-            }
-          }
-        ]
-      };
+          body: JSON.stringify(batchUpdatePayload)
+        });
 
-      const batchResponse = await fetch(updateUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(batchUpdatePayload)
-      });
-
-      if (!batchResponse.ok) {
-        throw new Error(`批量更新工作表结构失败：${await batchResponse.text()}`);
+        if (!batchResponse.ok) {
+          throw new Error(`批量更新工作表结构失败：${await batchResponse.text()}`);
+        }
       }
 
       // 3. Write new values to the inserted rows
-      const targetWriteRange = `${sheetName}!A${startRowIndex}:L${Number(startRowIndex) + newRowCount - 1}`;
+      const targetWriteRange = `${sheetName}!A${startRowIndex}:P${Number(startRowIndex) + newRowCount - 1}`;
       const writeUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(targetWriteRange)}?valueInputOption=USER_ENTERED`;
       const writeResponse = await fetch(writeUrl, {
         method: "PUT",
@@ -575,6 +579,139 @@ app.post("/api/proxy-direct-sheets", async (req, res) => {
   } catch (error: any) {
     console.error("Error proxying direct Sheets call:", error.message);
     return res.status(500).json({ error: error.message || "Failed to sync to Google Sheets." });
+  }
+});
+
+// Proxy endpoint to batch reset & beautify sheet borders
+app.post("/api/proxy-beautify-borders", async (req, res) => {
+  try {
+    const { spreadsheetId, accessToken, appsScriptUrl, sheetName, endRowIndexes } = req.body;
+    if (!spreadsheetId) {
+      return res.status(400).json({ error: "Missing spreadsheetId." });
+    }
+
+    const cleanSheetName = sheetName || "Sheet1";
+
+    if (appsScriptUrl) {
+      // 1. Through Apps Script Web App (delegates formatting to Apps Script)
+      const response = await fetch(appsScriptUrl.trim(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          spreadsheetId,
+          sheetName: cleanSheetName,
+          action: "beautifyBorders",
+          endRowIndexes
+        })
+      });
+
+      const text = await response.text();
+      let resJson: any = {};
+      try {
+        resJson = JSON.parse(text);
+      } catch {
+        resJson = { success: false, error: text };
+      }
+
+      if (!response.ok || resJson.success === false) {
+        return res.status(response.status).json({ error: resJson.error || "Google Apps Script 边框重置失败。" });
+      }
+      return res.json({ success: true, message: "Successfully beautified borders via Apps Script." });
+    } else {
+      // 2. Direct API
+      if (!accessToken) {
+        return res.status(400).json({ error: "Missing accessToken for direct Sheets API mode." });
+      }
+
+      // Fetch spreadsheet metadata to locate sheetId
+      const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
+      const metaResponse = await fetch(metaUrl, {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`
+        }
+      });
+
+      if (!metaResponse.ok) {
+        throw new Error(`无法获取工作表配置：${await metaResponse.text()}`);
+      }
+      const metaData = await metaResponse.json();
+      const foundSheet = metaData.sheets?.find(
+        (s: any) => s.properties?.title === cleanSheetName
+      );
+
+      if (!foundSheet) {
+        throw new Error(`未能在当前工作簿中找到名为 [${cleanSheetName}] 的工作表。`);
+      }
+      const sheetId = foundSheet.properties?.sheetId;
+      const lastRow = foundSheet.properties?.gridProperties?.rowCount || 1000;
+
+      const requests: any[] = [];
+
+      // A. Clear all borders on data rows 2 to lastRow (index 1 to lastRow - 1)
+      requests.push({
+        updateBorders: {
+          range: {
+            sheetId: sheetId,
+            startRowIndex: 1, // Row 2 (0-based)
+            endRowIndex: lastRow,
+            startColumnIndex: 0,
+            endColumnIndex: 26
+          },
+          top: { style: "NONE" },
+          bottom: { style: "NONE" },
+          left: { style: "NONE" },
+          right: { style: "NONE" },
+          innerHorizontal: { style: "NONE" },
+          innerVertical: { style: "NONE" }
+        }
+      });
+
+      // B. Redraw bottom borders for each receipt
+      if (endRowIndexes && Array.isArray(endRowIndexes)) {
+        for (const endRow of endRowIndexes) {
+          const targetRowIndex = Number(endRow) - 1; // 0-based index
+          if (targetRowIndex >= 1) {
+            requests.push({
+              updateBorders: {
+                range: {
+                  sheetId: sheetId,
+                  startRowIndex: targetRowIndex,
+                  endRowIndex: targetRowIndex + 1,
+                  startColumnIndex: 0,
+                  endColumnIndex: 26
+                },
+                bottom: {
+                  style: "SOLID_MEDIUM",
+                  color: { red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0 }
+                }
+              }
+            });
+          }
+        }
+      }
+
+      const updateUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`;
+      const batchResponse = await fetch(updateUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ requests })
+      });
+
+      if (!batchResponse.ok) {
+        throw new Error(`批量边框格式化更新失败：${await batchResponse.text()}`);
+      }
+
+      return res.json({ success: true, message: "Successfully beautified borders via Direct API." });
+    }
+  } catch (error: any) {
+    console.error("Error in beautify borders proxy endpoint:", error?.message);
+    return res.status(500).json({ error: error?.message || "Failed to beautify spreadsheet borders." });
   }
 });
 
